@@ -2,13 +2,31 @@
 import argparse
 import logging
 import multiprocessing
+import numpy as np
+import os
 import threading
+import matplotlib.pyplot as plt
 import pynmea2
 
 from scatter_plotter import ScatterPlotter
+from tqdm import *
+from queue import Queue
 
-MIN_SPEED = 5
+MIN_SPEED = 6
 INVALID_HEADING = 1000
+INVALIDE_ROTATION_SPEED = 0
+INTEGRATION_DURATION = 1
+
+class Elem():
+    def __init__(self, second, heading, bottom_heading, rotation_speed, sog):
+        self._second = second
+        self._heading = heading
+        self._rotation_speed = rotation_speed
+        self._bottom_heading = bottom_heading
+        self._sog = sog
+
+    def __str__(self):
+        return f"heading {self._heading} / bottom heading {self._bottom_heading} / rotation speed {self._rotation_speed} at {self._second}"
 
 def prepare_logger(logger_name, verbosity, log_file=None):
     """Initialize and set the logger.
@@ -51,42 +69,87 @@ def get_delta_heading(bottom_heading, compass_heading):
         delta_heading = 360 + delta_heading
     return delta_heading
 
+def get_rotation_speed(elems, current_heading, current_second):
+    for elem in elems:
+        if (current_second - elem._second) >= INTEGRATION_DURATION:
+            return abs(get_delta_heading(current_heading, elem._heading) / (current_second - elem._second))
+    return INVALIDE_ROTATION_SPEED
+
+def plot_data(elems):
+    heading = []
+    time = []
+    rotation_speed = []
+    bottom_heading = []
+    sog = []
+    for elem in elems:
+        time.append(elem._second)
+        heading.append(elem._heading)
+        rotation_speed.append(elem._rotation_speed)
+        bottom_heading.append(elem._bottom_heading)
+        sog.append(elem._sog)
+    xpoints = np.array(time)
+    ypoints = np.array(heading)
+    y2points = np.array(rotation_speed)
+    y3points = np.array(bottom_heading)
+    y4points = np.array(sog)
+    plt.plot(xpoints, ypoints, label = 'heading', color = 'purple')
+    plt.plot(xpoints, y2points, label = 'rotation speed', color = 'red')
+    plt.plot(xpoints, y3points, label = 'bottom heading', color = 'green')
+    plt.plot(xpoints, y4points, label = 'speed over ground', color = 'blue')
+    plt.legend()
+    plt.show()
+
 def parse_file(inputfile, queue_delta_heading):
     bottom_heading = INVALID_HEADING
     compass_heading = INVALID_HEADING
-    previous_delta_heading = INVALID_HEADING
-    previous_bottom_heading = INVALID_HEADING
+    line_counter = 0
+    rotation_speed = 0
     sog = 0
     fail = 0
-    with open(inputfile, "r") as fi:
-        queue_delta_heading.put(['Start', inputfile, 'delta heading', 'heading'])
-        for line in fi:
-            try:
-                msg = pynmea2.parse(line[12:])
+    seconds = 0
+    elems = []
+    max_rotation_speed = 0
+    time_base = 0
+
+    with tqdm(total=os.path.getsize(inputfile)) as pbar:
+        with open(inputfile, "r") as fi:
+            #queue_delta_heading.put(['Start', inputfile, 'delta heading', 'heading'])
+            for line in fi:
+                line_counter +=1
+                pbar.update(len(line))
                 try:
-                    if msg.sentence_type == 'VTG':
-                        bottom_heading = msg.true_track
-                        sog = msg.spd_over_grnd_kts
-                        # print(repr(msg))
-                    if msg.sentence_type =='VHW':
-                        compass_heading = msg.heading_true  # msg.heading_magnetic
-                except Exception as e:
-                    # print(e)
+                    msg = pynmea2.parse(line[12:], check=True)
+                    #msg = pynmea2.parse(line, check=True)
+                    try:
+                        if msg.sentence_type == 'VTG':
+                            bottom_heading = msg.true_track
+                            sog = msg.spd_over_grnd_kts
+                        elif msg.sentence_type =='VHW':
+                            compass_heading = msg.heading_true  # msg.heading_magnetic
+                        elif msg.sentence_type == 'ZDA':
+                            t = msg.timestamp
+                            if time_base == 0:
+                                time_base = (t.hour * 60 + t.minute) * 60 + t.second
+                            if time_base > (t.hour * 60 + t.minute) * 60 + t.second:
+                                continue  #  ZDA has wrong value sometime
+                            seconds = (t.hour * 60 + t.minute) * 60 + t.second - time_base
+                            rotation_speed = get_rotation_speed(elems, compass_heading, seconds)
+                            if compass_heading!=INVALID_HEADING and bottom_heading!=INVALID_HEADING:
+                                elems.insert(0, Elem(seconds, compass_heading, bottom_heading, rotation_speed, sog))
+                        else:
+                            continue
+                            
+                    except Exception as e:
+                        #print(e)
+                        continue
+                except pynmea2.ParseError as e:
+                    #print('Parse error: {}'.format(e))
+                    fail += 1
                     continue
-            except pynmea2.ParseError as e:
-                #print('Parse error: {}'.format(e))
-                fail += 1
-                continue
-            if sog > MIN_SPEED:  # bottom heading is not accurate when sog is too low
-                # print(f"bottom {bottom_heading} compass {compass_heading}")
-                delta_heading = get_delta_heading(int(bottom_heading), int(compass_heading))
-                if (delta_heading != previous_delta_heading) or (bottom_heading != previous_bottom_heading):
-                    previous_delta_heading = delta_heading
-                    previous_bottom_heading = bottom_heading
-                    queue_delta_heading.put([delta_heading, int(bottom_heading)])
 
-
-        queue_delta_heading.put(['Stop',])
+            plot_data(elems)
+        
+            #queue_delta_heading.put(['Stop',])
 
 
 def main():
@@ -100,16 +163,17 @@ def main():
 
     logger = prepare_logger("nmea_parser", args.verbosity, args.logfile)
     queue_delta_heading = multiprocessing.Queue()
-    plotter_delta_heading = ScatterPlotter(queue_delta_heading, logger)
+    #plotter_delta_heading = ScatterPlotter(queue_delta_heading, logger)
 
-    plotter_delta_heading.start()
+    #plotter_delta_heading.start()
 
     logger.info(f"Start parsing of {args.inputfile}")
-    parser = threading.Thread(target=parse_file, args=(args.inputfile, queue_delta_heading))
-    parser.start()
-    parser.join()
+    parse_file(args.inputfile, queue_delta_heading)
+    # parser = threading.Thread(target=parse_file, args=(args.inputfile, queue_delta_heading))
+    # parser.start()
+    # parser.join()
     logger.info(f"End of parsing {args.inputfile}")
-    plotter_delta_heading.join()
+    #plotter_delta_heading.join()
     logger.info(f"End of plotting")
 
 
