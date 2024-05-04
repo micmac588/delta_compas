@@ -15,7 +15,7 @@ from queue import Queue
 MIN_SPEED = 6
 INVALID_HEADING = 1000
 INVALIDE_ROTATION_SPEED = 0
-INTEGRATION_DURATION =  5
+INTEGRATION_DURATION = 1
 
 class Elem():
     def __init__(self, second, heading, bottom_heading, rotation_speed, sog):
@@ -69,15 +69,11 @@ def get_delta_heading(bottom_heading, compass_heading):
         delta_heading = 360 + delta_heading
     return delta_heading
 
-def get_rotation_speed(heading_array):
-    if len(heading_array) < INTEGRATION_DURATION:
-        return INVALIDE_ROTATION_SPEED
-    first = heading_array[0]
-    last = heading_array[INTEGRATION_DURATION-1]
-    if (last._second - first._second) == 0:
-        return INVALIDE_ROTATION_SPEED
-
-    return abs(get_delta_heading(last._heading, first._heading) / (last._second - first._second))
+def get_rotation_speed(elems, current_heading, current_second):
+    for elem in elems:
+        if (current_second - elem._second) >= INTEGRATION_DURATION:
+            return abs(get_delta_heading(current_heading, elem._heading) / (current_second - elem._second))
+    return INVALIDE_ROTATION_SPEED
 
 def plot_data(elems):
     heading = []
@@ -137,7 +133,7 @@ def parse_file(inputfile, queue_delta_heading):
                             if time_base > (t.hour * 60 + t.minute) * 60 + t.second:
                                 continue  #  ZDA has wrong value sometime
                             seconds = (t.hour * 60 + t.minute) * 60 + t.second - time_base
-                            rotation_speed = get_rotation_speed(elems) # TODO devrait être calculé avec les données courantes.
+                            rotation_speed = get_rotation_speed(elems, compass_heading, seconds)
                             if compass_heading!=INVALID_HEADING and bottom_heading!=INVALID_HEADING:
                                 elems.insert(0, Elem(seconds, compass_heading, bottom_heading, rotation_speed, sog))
                         else:
