@@ -8,7 +8,6 @@ import threading
 import matplotlib.pyplot as plt
 import pynmea2
 
-from scatter_plotter import ScatterPlotter
 from tqdm import *
 from queue import Queue
 
@@ -99,7 +98,7 @@ def plot_data(elems):
     plt.legend()
     plt.show()
 
-def parse_file(inputfile, queue_delta_heading):
+def parse_file(inputfile):
     bottom_heading = INVALID_HEADING
     compass_heading = INVALID_HEADING
     line_counter = 0
@@ -113,13 +112,12 @@ def parse_file(inputfile, queue_delta_heading):
 
     with tqdm(total=os.path.getsize(inputfile)) as pbar:
         with open(inputfile, "r") as fi:
-            #queue_delta_heading.put(['Start', inputfile, 'delta heading', 'heading'])
             for line in fi:
                 line_counter +=1
                 pbar.update(len(line))
                 try:
-                    msg = pynmea2.parse(line[12:], check=True)
-                    #msg = pynmea2.parse(line, check=True)
+                    #msg = pynmea2.parse(line[12:], check=True)
+                    msg = pynmea2.parse(line, check=True)
                     try:
                         if msg.sentence_type == 'VTG':
                             bottom_heading = msg.true_track
@@ -146,10 +144,8 @@ def parse_file(inputfile, queue_delta_heading):
                     #print('Parse error: {}'.format(e))
                     fail += 1
                     continue
-
-            plot_data(elems)
+    return elems
         
-            #queue_delta_heading.put(['Stop',])
 
 
 def main():
@@ -162,22 +158,18 @@ def main():
     args = parser.parse_args()
 
     logger = prepare_logger("nmea_parser", args.verbosity, args.logfile)
-    queue_delta_heading = multiprocessing.Queue()
-    #plotter_delta_heading = ScatterPlotter(queue_delta_heading, logger)
-
-    #plotter_delta_heading.start()
 
     logger.info(f"Start parsing of {args.inputfile}")
-    parse_file(args.inputfile, queue_delta_heading)
-    # parser = threading.Thread(target=parse_file, args=(args.inputfile, queue_delta_heading))
-    # parser.start()
-    # parser.join()
+    elems = parse_file(args.inputfile)
     logger.info(f"End of parsing {args.inputfile}")
-    #plotter_delta_heading.join()
+
+    logger.info(f"Start plotting")
+    if elems is None or len(elems) == 0:
+        logger.warning("Nothing to plot")
+        exit(-1)
+    plot_data(elems)
     logger.info(f"End of plotting")
 
-
-    
 
 if __name__ == "__main__":
     main()
