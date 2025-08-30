@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
 import logging
-import multiprocessing
 import numpy as np
 import os
-import threading
+import re
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pynmea2
 
 from tqdm import *
@@ -17,15 +18,16 @@ INVALIDE_ROTATION_SPEED = 0
 INTEGRATION_DURATION = 1
 
 class Elem():
-    def __init__(self, second, heading, bottom_heading, rotation_speed, sog):
-        self._second = second
+    def __init__(self, date, second, heading, bottom_heading, rotation_speed, sog):
+        self._date = date
+        self._second = second    # TODO not necessary to store this.
         self._heading = heading
         self._rotation_speed = rotation_speed
         self._bottom_heading = bottom_heading
         self._sog = sog
 
     def __str__(self):
-        return f"heading {self._heading} / bottom heading {self._bottom_heading} / rotation speed {self._rotation_speed} at {self._second}"
+        return f"heading {self._heading} / bottom heading {self._bottom_heading} / rotation speed {self._rotation_speed} at {self._date}"
 
 def prepare_logger(logger_name, verbosity, log_file=None):
     """Initialize and set the logger.
@@ -74,14 +76,14 @@ def get_rotation_speed(elems, current_heading, current_second):
             return abs(get_delta_heading(current_heading, elem._heading) / (current_second - elem._second))
     return INVALIDE_ROTATION_SPEED
 
-def plot_data(elems):
+def plot_data(elems, logger):
     heading = []
     time = []
     rotation_speed = []
     bottom_heading = []
     sog = []
     for elem in elems:
-        time.append(elem._second)
+        time.append(elem._date)
         heading.append(elem._heading)
         rotation_speed.append(elem._rotation_speed)
         bottom_heading.append(elem._bottom_heading)
@@ -91,24 +93,23 @@ def plot_data(elems):
     y2points = np.array(rotation_speed)
     y3points = np.array(bottom_heading)
     y4points = np.array(sog)
-    plt.plot(xpoints, ypoints, label = 'heading', color = 'purple')
-    plt.plot(xpoints, y2points, label = 'rotation speed', color = 'red')
-    plt.plot(xpoints, y3points, label = 'bottom heading', color = 'green')
-    plt.plot(xpoints, y4points, label = 'speed over ground', color = 'blue')
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator())
+    plt.gca().plot(xpoints, ypoints, label = 'heading', color = 'purple')
+    plt.gca().plot(xpoints, y2points, label = 'rotation speed', color = 'red')
+    plt.gca().plot(xpoints, y3points, label = 'bottom heading', color = 'green')
+    # plt.plot(xpoints, y4points, label = 'speed over ground', color = 'blue')
     plt.legend()
     plt.show()
 
-def parse_file(inputfile):
+def parse_file(inputfile, logger):
     bottom_heading = INVALID_HEADING
     compass_heading = INVALID_HEADING
     line_counter = 0
     rotation_speed = 0
     sog = 0
     fail = 0
-    seconds = 0
     elems = []
-    max_rotation_speed = 0
-    time_base = 0
 
     with tqdm(total=os.path.getsize(inputfile)) as pbar:
         with open(inputfile, "r") as fi:
@@ -116,42 +117,121 @@ def parse_file(inputfile):
                 line_counter +=1
                 pbar.update(len(line))
                 try:
-                    #msg = pynmea2.parse(line[12:], check=True)
-                    msg = pynmea2.parse(line, check=True)
+                    msg = pynmea2.parse(line[12:], check=True)
+                    #msg = pynmea2.parse(line, check=True)
                     try:
+                        if not hasattr(msg, 'sentence_type'):
+                            # $PNKEP (proprietary sentence has no attribute sentence_type)
+                            # see https://www.hisse-et-oh.com/sailing/canaux-performances-de-maxsea-sur-tl-25-nke
+                            fail += 1
+                            continue
                         if msg.sentence_type == 'VTG':
+                            try:
+                                int(msg.true_track)
+                            except Exception as e:
+                                fail += 1
+                                continue
+                            try:
+                                float(msg.spd_over_grnd_kts)
+                            except Exception as e:
+                                fail += 1
+                                continue
                             bottom_heading = msg.true_track
+                            if bottom_heading > 360:
+                                fail += 1
+                                continue
                             sog = msg.spd_over_grnd_kts
+                            logger.info(f"bottom_heading {bottom_heading}")
                         elif msg.sentence_type =='VHW':
                             compass_heading = msg.heading_true  # msg.heading_magnetic
+                            if compass_heading > 360:
+                                compass_heading=INVALID_HEADING 
+                                fail += 1
+                                continue
+                            logger.info(f"compass_heading {compass_heading}")
                         elif msg.sentence_type == 'ZDA':
-                            t = msg.timestamp
-                            if time_base == 0:
-                                time_base = (t.hour * 60 + t.minute) * 60 + t.second
-                            if time_base > (t.hour * 60 + t.minute) * 60 + t.second:
-                                continue  #  ZDA has wrong value sometime
-                            seconds = (t.hour * 60 + t.minute) * 60 + t.second - time_base
-                            rotation_speed = get_rotation_speed(elems, compass_heading, seconds)
+                            logger.info(f"ZDA {repr(msg)}")
+                            if msg.talker == 'GP':
+                                # do not use GPZDA, use IIZDA instead
+                                continue
+                            try:
+                                date = datetime.datetime(msg.year, msg.month, msg.day,
+                                                        msg.timestamp.hour,
+                                                        msg.timestamp.minute,
+                                                        msg.timestamp.second)
+                            except Exception as e:
+                                logger.error(f'Wrong date/time is {repr(msg)} : {e}')
+                                fail += 1
+                                continue
+                            logger.info(f"{date} at {line_counter}")
+                            current_second = int(date.timestamp()) # epoch time
+                            if len(elems) and date < elems[len(elems)-1]._date:
+                                #  ZDA has wrong value sometime
+                                logger.error(f'Current date < previous date in {repr(msg)}')
+                                fail += 1
+                                continue
+                            rotation_speed = get_rotation_speed(elems, compass_heading, current_second)
                             if compass_heading!=INVALID_HEADING and bottom_heading!=INVALID_HEADING:
-                                elems.insert(0, Elem(seconds, compass_heading, bottom_heading, rotation_speed, sog))
+                                elems.insert(0, Elem(date, current_second, compass_heading, bottom_heading, rotation_speed, sog))
                         else:
                             continue
                             
                     except Exception as e:
-                        #print(e)
+                        logger.error(f'{e} for {line}, {repr(msg)}')
+                        fail += 1
                         continue
                 except pynmea2.ParseError as e:
-                    #print('Parse error: {}'.format(e))
                     fail += 1
                     continue
+    logger.info(f"failures: {fail/line_counter*100}%")
     return elems
-        
 
+def open_output_file(inputfile, line, previous_fo):
+    # look for something like 04/02/2024 07:23:58  - Debut
+    pattern = r'(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2}):(\d{2})  - Debut'
+    result = re.search(pattern, line)
+    if result is None:
+        # return the previous file descriptor
+        return previous_fo
+    if previous_fo:
+        previous_fo.close()  # close the previous
+    result = re.search(pattern, line)
+    day = result.group(1)
+    month = result.group(2)
+    year = result.group(3)
+    hour = result.group(4)
+    minute = result.group(5)
+    second = result.group(6)
+    outputfile = inputfile.split('.')[0] + day + month + year + hour + minute + second + '.log'
+    fo = open(outputfile, 'x') # open the new one
+    return fo
+                
+def split(inputfile, logger):
+    # Split the log file when it has several 'Debut'
+    line_counter = 0
+    fail = 0
+    fo = None
+    with tqdm(total=os.path.getsize(inputfile)) as pbar:
+        with open(inputfile, "r") as fi:
+            try:
+                for line in fi:
+                    line_counter +=1
+                    pbar.update(len(line))
+
+                    fo = open_output_file(inputfile, line, fo)
+                    if fo:
+                        fo.write(line)
+                    
+            except Exception as e:
+                print(e)
+                fail +=1
 
 def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--inputfile", help="the nmea log file.", required=True)
+    parser.add_argument("-s", "--split", action="store_true", help="split input file", required=False)
+    parser.add_argument("-d", "--deltacompas", action="store_true", help="plot bottom heading and compas heading", required=False)
     parser.add_argument("-v", "--verbosity", action="count", default=0, help="increase the verbosity", required=False)
     parser.add_argument("-l", "--logfile", help="log file name", required=False)
 
@@ -159,16 +239,21 @@ def main():
 
     logger = prepare_logger("nmea_parser", args.verbosity, args.logfile)
 
-    logger.info(f"Start parsing of {args.inputfile}")
-    elems = parse_file(args.inputfile)
-    logger.info(f"End of parsing {args.inputfile}")
+    if args.split:
+        logger.info(f"Start splitting of {args.inputfile}")
+        split(args.inputfile, logger)
 
-    logger.info(f"Start plotting")
-    if elems is None or len(elems) == 0:
-        logger.warning("Nothing to plot")
-        exit(-1)
-    plot_data(elems)
-    logger.info(f"End of plotting")
+    elif args.deltacompas:
+        logger.info(f"Start parsing of {args.inputfile}")
+        elems = parse_file(args.inputfile,logger)
+        logger.info(f"End of parsing {args.inputfile}")
+
+        logger.info(f"Start plotting")
+        if elems is None or len(elems) == 0:
+            logger.warning("Nothing to plot")
+            exit(-1)
+        plot_data(elems, logger)
+        logger.info(f"End of plotting")
 
 
 if __name__ == "__main__":
